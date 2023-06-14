@@ -1,5 +1,6 @@
 """Basic script to train CIFAR10 and ImageNet close to SOTA with ResNets"""
 """96.86% : python main.py --width 256 --batch-size 64 --seed 0 --adam --steps 500000"""
+"""98.10% : python main.py --width 512 --batch-size 128 --seed 0"""
 
 import torch
 import torch.nn as nn
