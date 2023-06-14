@@ -76,17 +76,20 @@ class Thrifty(nn.Module):
 
         return self.classifier(y)
 
-def thrifty(num_classes, large_input, width):
+def thrifty18(num_classes, large_input, width):
     return Thrifty(width, 8, [2, 4, 6], num_classes)
 
-def resnet18(num_classes, large_input, width):
-    return ResNet(BasicBlock, [2, 2, 2, 2], num_classes, large_input, width)
+def thrifty50(num_classes, large_input, width):
+    return Thrifty(width, 16, [3, 7, 13], num_classes)
 
+def thrifty20(num_classes, large_input, width):
+    return Thrifty(width, 9, [3, 6], num_classes)
+
+def thrifty56(num_classes, large_input, width):
+    return Thrifty(width, 27, [9, 18], num_classes)
+    
 def resnet34(num_classes, large_input, width):
     return ResNet(BasicBlock, [3, 4, 6, 3], num_classes, large_input, width)
-
-def resnet50(num_classes, large_input, width):
-    return ResNet(Bottleneck, [3, 4, 6, 3], num_classes, large_input, width)
 
 def resnet101(num_classes, large_input, width):
     return ResNet(Bottleneck, [3, 4, 23, 3], num_classes, large_input, width)
@@ -94,17 +97,11 @@ def resnet101(num_classes, large_input, width):
 def resnet152(num_classes, large_input, width):
     return ResNet(Bottleneck, [3, 8, 36, 3], num_classes, large_input, width)
 
-def resnet20(num_classes, large_input, width):
-    return ResNet(BasicBlock, [3, 3, 3], num_classes, large_input, width)
-
 def resnet32(num_classes, large_input, width):
     return ResNet(BasicBlock, [5, 5, 5], num_classes, large_input, width)
 
 def resnet44(num_classes, large_input, width):
     return ResNet(BasicBlock, [7, 7, 7], num_classes, large_input, width)
-
-def resnet56(num_classes, large_input, width):
-    return ResNet(BasicBlock, [9, 9, 9], num_classes, large_input, width)
 
 def resnet110(num_classes, large_input, width):
     return ResNet(BasicBlock, [18, 18, 18], num_classes, large_input, width)

@@ -27,6 +27,7 @@ parser.add_argument('--width', type=int, default=64, help="number of feature map
 parser.add_argument('--dataset-path', type=str, default=os.getenv("DATASETS"))
 parser.add_argument('--cifar-resize', type=int, default=32)
 parser.add_argument('--label-smoothing', type=float, default=0.1)
+parser.add_argument('--model', type=str, default="thrifty18")
 parser.add_argument('--adam', action="store_true")
 args = parser.parse_args()
 
@@ -97,7 +98,7 @@ test_loader = torch.utils.data.DataLoader(
         test, batch_size=args.batch_size, shuffle=False,
         num_workers=30)
 
-net = thrifty(num_classes, large_input, args.width).to(args.device)
+net = eval(args.model)(num_classes, large_input, args.width).to(args.device)
 num_parameters = int(torch.tensor([x.numel() for x in net.parameters()]).sum().item())
 print("{:d} parameters".format(num_parameters))
 
