@@ -18,22 +18,16 @@ class Thrifty(nn.Module):
 
         bn1 = []
         bn2 = []
-        subfilters1 = []
-        subfilters2 = []
         reduction = self.reduction
         for i in range(depth):
             if i in self.downsampling:
                 reduction = reduction // 2
             bn1.append(nn.BatchNorm2d(hidden_dim // reduction))
             bn2.append(nn.BatchNorm2d(hidden_dim // reduction))
-            subfilters1.append(torch.randperm(hidden_dim)[:hidden_dim // reduction])
-            subfilters2.append(torch.randperm(hidden_dim)[:hidden_dim // reduction])
 
             
         self.bn1 = nn.ModuleList(bn1)
         self.bn2 = nn.ModuleList(bn2)
-        self.subfilters1 = subfilters1
-        self.subfilters2 = subfilters2
             
         self.hidden_dim = hidden_dim
 
@@ -55,13 +49,13 @@ class Thrifty(nn.Module):
                 new_reduction = reduction // 2
             else:
                 new_reduction = reduction
-            convweight1 = self.conv1.weight[self.subfilters1[i]].permute(1,0,2,3)[self.subfilters1[i]].permute(1,0,2,3)
-            z = torch.nn.functional.conv2d(y, weight=convweight1[:,:self.hidden_dim // reduction], padding=1)
+#            convweight1 = self.conv1.weight[self.subfilters1[i]].permute(1,0,2,3)[self.subfilters1[i]].permute(1,0,2,3)
+            z = torch.nn.functional.conv2d(y, weight=self.conv1.weight[:self.hidden_dim // new_reduction,:self.hidden_dim // reduction], padding=1)
             z = self.bn1[i](z)
             z = torch.relu(z)
 #            z = self.conv2(z)
-            convweight2 = self.conv2.weight[self.subfilters2[i]].permute(1,0,2,3)[self.subfilters2[i]].permute(1,0,2,3)
-            z = torch.nn.functional.conv2d(z, weight=convweight2, padding=1)
+#            convweight2 = self.conv2.weight[self.subfilters2[i]].permute(1,0,2,3)[self.subfilters2[i]].permute(1,0,2,3)
+            z = torch.nn.functional.conv2d(z, weight=self.conv2.weight[:self.hidden_dim // new_reduction,:self.hidden_dim // new_reduction], padding=1)
             z = self.bn2[i](z)
             if i in self.downsampling:
                 size = y.shape[1]

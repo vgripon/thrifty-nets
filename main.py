@@ -1,6 +1,30 @@
 """Basic script to train CIFAR10 and ImageNet close to SOTA with ResNets"""
-"""96.86% : python main.py --width 256 --batch-size 64 --seed 0 --adam --steps 500000"""
-"""98.10% : python main.py --width 512 --batch-size 128 --seed 0"""
+
+"""
+CIFAR10
+accelerate launch --mixed_precision fp16 main.py --model $model --cifar-resize $size --batch-size 128 --seed 0
+model     |         32         |         52         |
+resnet20  | 97.97% ( 90% 2h30) | 97.66% (100% 3h38) |
+resnet56  | 98.27% ( 90% 5h22) | 98.40% ( 90% 9h19) |
+resnet18  | 97.77% (100% 2h28) | 98.01% ( 90% 3h11) | 
+resnet50  | 98.17% ( 90% 5h18) | 
+resnet20, width 16, 32x32: 94.65% 
+resnet56, width 16, 32x32: 96.76%
+
+CIFAR100
+accelerate launch --mixed_precision fp16 main.py --model $model --dataset cifar100 --cifar-resize $size --batch-size 128 --seed 0
+model     |         32         |         52         |
+resnet20  | 83.69% ( 90% 2h32) | 83.88% ( 70% 3h42) | 
+resnet56  | 85.64% ( 70% 5h27) | 85.96% ( 70% 9h19) |
+resnet18  | 82.96% ( 70% 2h16) | 84.89% ( 80% 3h11) |
+resnet50  | 84.81% ( 60% 5h39) |
+resnet20, width 16, 32x32: 71.83%
+resnet56, width 16, 32x32: 79.18%
+
+ImageNet
+accelerate launch --mixed_precision fp16 main.py --model resnet18 --dataset imagenet --seed 0
+accelerate launch --mixed_precision fp16 main.py --model resnet50 --dataset imagenet --seed 0
+"""
 
 import torch
 import torch.nn as nn
@@ -13,32 +37,42 @@ import random
 import time
 import math
 import numpy as np
-from ema_pytorch import EMA
+from accelerate import Accelerator
 
 from thrifty import *
 
+from utils import ExponentialMovingAverage, RandomMixup, RandomCutmix
+from torch.utils.data.dataloader import default_collate
+
+accelerator = Accelerator()
+
 parser = argparse.ArgumentParser(description="Vincent's Training Routine")
-parser.add_argument('--device', type=str, default="cuda:0")
 parser.add_argument('--dataset', type=str, default="CIFAR10", help="CIFAR10, CIFAR100 or ImageNet")
 parser.add_argument('--steps', type=int, default=750000)
 parser.add_argument('--batch-size', type = int, default=1024)
 parser.add_argument('--seed', type = int, default = random.randint(0, 1000000000))
-parser.add_argument('--width', type=int, default=64, help="number of feature maps")
+parser.add_argument('--model', type=str, default="resnet50")
+parser.add_argument('--width', type=int, default=64, help="number of feature maps for first layers")
 parser.add_argument('--dataset-path', type=str, default=os.getenv("DATASETS"))
 parser.add_argument('--cifar-resize', type=int, default=32)
 parser.add_argument('--label-smoothing', type=float, default=0.1)
-parser.add_argument('--model', type=str, default="thrifty18")
+parser.add_argument('--test-steps', type=int, default=15)
 parser.add_argument('--adam', action="store_true")
+parser.add_argument('--mixup-alpha', type=float, default=0.2)
+parser.add_argument('--cutmix-alpha', type=float, default=1.)
+parser.add_argument('--eras', type=int, default=1)
 args = parser.parse_args()
+args.steps = 10 * (args.steps // 10)
 
+# deterministic mode for reproducibility
 random.seed(args.seed)
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 torch.use_deterministic_algorithms(True)
 print("random seed is", args.seed)
 
+# prepare dataloaders
 normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-
 if args.dataset.lower() == "imagenet":
     train = torchvision.datasets.ImageNet(
         root=args.dataset_path,
@@ -70,46 +104,56 @@ if args.dataset.lower() == "cifar10" or args.dataset.lower() == "cifar100":
     train = tvdset(
         root=args.dataset_path,
         train=True,
-        transform = transforms.Compose([
+        transform=transforms.Compose([
             transforms.RandomHorizontalFlip(),
             transforms.RandomCrop(32, padding=4),
-#            torchvision.transforms.AutoAugment(policy=torchvision.transforms.autoaugment.AutoAugmentPolicy.CIFAR10),
             transforms.TrivialAugmentWide(),
             transforms.ToTensor(),
             normalize,
-            transforms.Resize(args.cifar_resize, antialias=True),#, interpolation=transforms.InterpolationMode.NEAREST),
+            transforms.Resize(args.cifar_resize, antialias=True),
             transforms.RandomErasing(0.1)
         ]))
     test = tvdset(
         root=args.dataset_path,
         train=False,
-        transform = transforms.Compose([
+        transform=transforms.Compose([
             transforms.ToTensor(),
             normalize,
-            transforms.Resize(args.cifar_resize, antialias=True)#, interpolation=transforms.InterpolationMode.NEAREST)
+            transforms.Resize(args.cifar_resize, antialias=True)
         ]))
     large_input = False
 
+
+mixupcutmix = torchvision.transforms.RandomChoice(
+    [RandomMixup(num_classes, p=1.0, alpha=args.mixup_alpha),
+     RandomCutmix(num_classes, p=1.0, alpha=args.cutmix_alpha)])
+
+
+def collate_fn(batch):
+    return mixupcutmix(*default_collate(batch))
+
+
 train_loader = torch.utils.data.DataLoader(
-        train, batch_size=args.batch_size, shuffle=True,
-        num_workers=30, drop_last=True)
+    train, batch_size=args.batch_size, shuffle=True,
+    num_workers=min(30, os.cpu_count()), drop_last=True, pin_memory=True,
+    collate_fn=collate_fn, persistent_workers=True)
+
 
 test_loader = torch.utils.data.DataLoader(
-        test, batch_size=args.batch_size, shuffle=False,
-        num_workers=30)
+    test, batch_size=args.batch_size, shuffle=False,
+    num_workers=min(30, os.cpu_count()), pin_memory=True,
+    persistent_workers=True)
 
-net = eval(args.model)(num_classes, large_input, args.width).to(args.device)
+# Prepare model, EMA and parameter sets
+net = eval(args.model)(num_classes, large_input, args.width)
+net, train_loader, test_loader = accelerator.prepare(net, train_loader, test_loader)
+net.to(non_blocking=True, memory_format=torch.channels_last)
 num_parameters = int(torch.tensor([x.numel() for x in net.parameters()]).sum().item())
-print("{:d} parameters".format(num_parameters))
+accelerator.print("{:d} parameters".format(num_parameters))
 
-ema = EMA(
-    net,
-    # beta = 0.99998,              # exponential moving average factor
-    # #update_after_step = (args.steps * 9) // 10,
-    # update_every = 32,          # how often to actually update, to save on compute (updates every 10th .update() call)
-)
-
-criterion = nn.CrossEntropyLoss(reduction = 'none', label_smoothing=args.label_smoothing)
+ema = ExponentialMovingAverage(net, decay=0.999)
+ema = accelerator.prepare(ema)
+ema.eval()
 
 modules = [x for x in net.modules()]
 wd = []
@@ -128,22 +172,23 @@ for x in modules:
     elif isinstance(x, nn.Conv2d):
         wd.append(x.weight)
         trained_parameters += x.weight.numel()
-assert(num_parameters == trained_parameters)
+assert(num_parameters==trained_parameters)
 
-train_losses = []
-test_scores = []
-test_scores_ema = []
-test_card = []
-step = 0
-epoch = 0
+# define criterion and aggregators
+criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+train_losses, test_scores, test_scores_ema, test_card = [], [], [], []
+peak, peak_step, peak_ema, peak_step_ema = 0, 0, 0, 0
+
+
+# test function
 def test():
     net.eval()
     correct = 0
     total = 0
     correct_ema = 0
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_idx, (inputs, targets) in enumerate(test_loader):
-            inputs, targets = inputs.to(args.device), targets.to(args.device)
+            inputs, targets = inputs.to(non_blocking=True, memory_format=torch.channels_last), targets.to(non_blocking=True)
             outputs = net(inputs)
             outputs_ema = ema(inputs)
             _, predicted = outputs.max(1)
@@ -151,93 +196,94 @@ def test():
             total += targets.size(0)
             correct += predicted.eq(targets).sum()
             correct_ema += predicted_ema.eq(targets).sum()
-    print("{:6.2f}% (ema: {:6.2f}%)".format(100.*correct/total, 100.*correct_ema/total))
+    accelerator.print("{:6.2f}% (ema: {:6.2f}%)".format(100.*correct/total, 100.*correct_ema/total))
+    net.train()
+    return correct_ema/total
 
-def rand_bbox(size, lam):
-    W = size[2]
-    H = size[3]
-    cut_rat = np.sqrt(1. - lam)
-    cut_w = int(W * cut_rat)
-    cut_h = int(H * cut_rat)
 
-    # uniform
-    cx = np.random.randint(W)
-    cy = np.random.randint(H)
-
-    bbx1 = np.clip(cx - cut_w // 2, 0, W)
-    bby1 = np.clip(cy - cut_h // 2, 0, H)
-    bbx2 = np.clip(cx + cut_w // 2, 0, W)
-    bby2 = np.clip(cy + cut_h // 2, 0, H)
-
-    return bbx1, bby1, bbx2, bby2
-
-start_time = time.time()
+start_time = 0
+epoch = 0
 
 test_enum = list(test_loader)
 index_test = 0
-for era in range(1):
-    while step < args.steps:
-        net.train()
-        if epoch == 0 and not(args.adam):
-            optimizer = torch.optim.SGD([{"params":wd, "weight_decay":2e-5}, {"params":nowd, "weight_decay":0}], lr=0.5, momentum=0.9, nesterov=True)
-            scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor = 0.2, total_iters = len(train_loader) * 5)
-        elif epoch == 5 or (epoch == 0 and args.adam):
-            if args.adam:
-                optimizer = torch.optim.AdamW([{"params":wd, "weight_decay":0.05}, {"params":nowd, "weight_decay":0}])
-            else:
-                optimizer = torch.optim.SGD([{"params":wd, "weight_decay":2e-5}, {"params":nowd, "weight_decay":0}], lr=0.5, momentum=0.9, nesterov=True)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.steps - step)
+
+net.train()
+
+for era in range(1 if args.adam else 0, args.eras + 1):
+    step = 0
+    print("{:s}".format("Era " + str(era) if era > 0 else "Warming up"))
+
+    # define optimizers/schedulers
+    if era == 0:
+        optimizer = torch.optim.SGD([{"params": wd, "weight_decay": 2e-5},
+                                     {"params": nowd, "weight_decay": 0}],
+                                    lr=0.5, momentum=0.9, nesterov=True)
+        scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, total_iters=len(train_loader) * 5)
+    else:
+        if args.adam:
+            optimizer = torch.optim.AdamW([{"params": wd, "weight_decay": 0.05},
+                                           {"params": nowd, "weight_decay": 0}],
+                                          lr = 1e-3 * (0.9 ** (era-1)))
+        else:
+            optimizer = torch.optim.SGD([{"params": wd, "weight_decay": 2e-5},
+                                         {"params": nowd, "weight_decay": 0}],
+                                        lr=0.5 * (0.9 ** (era-1)), momentum=0.9, nesterov=True)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.steps)
+    optimizer, scheduler = accelerator.prepare(optimizer, scheduler)
+
+    total_steps_for_era = args.steps if era > 0 else 5 * len(train_loader)
+
+    if start_time == 0:
+        start_time = time.time()
+    
+    while step < total_steps_for_era:
         for batch_idx, (inputs, targets) in enumerate(train_loader):
             step += 1
-            inputs, targets = inputs.to(args.device), targets.to(args.device)
+            inputs, targets = inputs.to(non_blocking=True, memory_format=torch.channels_last), targets.to(non_blocking=True)
 
-            choice = random.randint(0,1)
+            optimizer.zero_grad(set_to_none=True)
+            outputs = net(inputs)
 
-            if choice == 0:
-                perm = torch.randperm(inputs.shape[0]) # for mixup
-                #alpha = torch.rand(inputs.shape[0]).to(args.device)
-                alpha = np.random.beta(0.2, 0.2)
-                inputs = alpha * inputs + (1 - alpha) * inputs[perm] # mixing up the inputs
-                #inputs = alpha.reshape(-1,1,1,1) * inputs + (1 - alpha.reshape(-1,1,1,1)) * inputs[perm]
+            loss = criterion(outputs, targets)
 
-            else:
-                alpha = np.random.beta(1, 1)  # cutmix
-                perm = torch.randperm(inputs.size()[0]).to(args.device) # cutmix perm
-                bbx1, bby1, bbx2, bby2 = rand_bbox(inputs.size(), alpha)
-                inputs[:, :, bbx1:bbx2, bby1:bby2] = inputs[perm, :, bbx1:bbx2, bby1:bby2]
-                alpha = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (inputs.size()[-1] * inputs.size()[-2]))
-            
-            optimizer.zero_grad()
-            outputs = net(inputs) # computing softmax output
-
-            loss = (alpha * criterion(outputs, targets) + (1 - alpha) * criterion(outputs, targets[perm])).mean()
-
-            loss.backward()
+            accelerator.backward(loss)
             optimizer.step()
-            ema.update()
+            if step % 32 == 0:
+                ema.update_parameters(net)
+                if epoch < 5:
+                    ema.n_averaged.fill_(0)
             train_losses.append(loss.item())
             train_losses = train_losses[-len(train_loader):]
 
             scheduler.step()
             lr = scheduler.get_last_lr()[0]
-            print("\r{:6.2f}% loss:{:.4e} lr:{:.3e}".format(100*step / args.steps, torch.mean(torch.tensor(train_losses)).item(), lr), end="")
-            step_time = (time.time() - start_time) / (args.steps * era + step)
-            remaining_time = (args.steps - step) * step_time
-            print(" {:6.2f}% (ema {:6.2f}%) {:4d}h{:02d}m {:d} epochs".format(100 * torch.tensor(test_scores).sum() / torch.tensor(test_card).sum(), 100 * torch.tensor(test_scores_ema).sum() / torch.tensor(test_card).sum(), int(remaining_time / 3600), (int(remaining_time) % 3600) // 60, epoch), end='')
+            accelerator.print("\r{:6.2f}% loss:{:.4e} lr:{:.3e}".format(100 * step / total_steps_for_era, torch.mean(torch.tensor(train_losses)).item(), lr), end="")
 
-            if step == args.steps:
-                break
-            if batch_idx % 5 == 0:
+            step_time = (time.time() - start_time) / (args.steps * (era - 1 if era > 0 else 0) + step + (5 * len(train_loader) if not args.adam and era > 0 else 0))
+            remaining_time = (total_steps_for_era - step + (args.eras - era) * args.steps) * step_time
+            
+            if accelerator.is_main_process:
+                score = 100 * accelerator.gather_for_metrics(torch.tensor(test_scores)).sum() / accelerator.gather_for_metrics(torch.tensor(test_card)).sum()
+                score_ema = 100 * accelerator.gather_for_metrics(torch.tensor(test_scores_ema)).sum() / accelerator.gather_for_metrics(torch.tensor(test_card)).sum()
+                if score > peak:
+                    peak = score
+                    peak_step = step
+                if score_ema > peak_ema:
+                    peak_ema = score_ema
+                    peak_step_ema = step
+                accelerator.print("{:6.2f}% (ema: {:6.2f}%) {:4d}h{:02d}m epoch {:4d}".format(score, score_ema, int(remaining_time / 3600), (int(remaining_time) % 3600) // 60, epoch + 1), end='')
+
+            if batch_idx % args.test_steps == 0:
                 net.eval()
                 try:
-#                    _, (inputs, targets) = next(test_enum)
                     inputs, targets = test_enum[index_test]
                     index_test = (index_test + 1) % len(test_enum)
                 except StopIteration:
                     test_enum = enumerate(test_loader)
                     _, (inputs, targets) = next(test_enum)
-                inputs, targets = inputs.to(args.device), targets.to(args.device)
-                with torch.no_grad():
+                inputs, targets = inputs.to(non_blocking=True, memory_format=torch.channels_last), targets.to(non_blocking=True)
+                with torch.inference_mode():
                     outputs = net(inputs)
                     outputs_ema = ema(inputs)
                     _, predicted = outputs.max(1)
@@ -251,12 +297,16 @@ for era in range(1):
                     test_scores_ema = test_scores_ema[-len(test_enum):]
                     test_card = test_card[-len(test_enum):]
                 net.train()
+            if (era > 0 and (step % (total_steps_for_era // 10) == 0 or step == total_steps_for_era) and step > 1) or (era == 0 and step == total_steps_for_era):
+                accelerator.print("\r{:3d}%:   loss:{:.4e} lr:{:.3e}".format(round(100 * step / total_steps_for_era), torch.mean(torch.tensor(train_losses)).item(), lr), end='')
+                res = test()
+                if step == total_steps_for_era:
+                    break
         epoch += 1
 
 total_time = time.time() - start_time
-print()
-print("total time is {:4d}h{:02d}m".format(int(total_time / 3600), (int(total_time) % 3600) // 60))
-print()
-test()
-print()
-print()
+accelerator.print()
+accelerator.print("total time is {:4d}h{:02d}m".format(int(total_time / 3600), (int(total_time) % 3600) // 60))
+accelerator.print("Peak perf is {:6.2f}% at step {:d} ({:6.2f}% at step {:d})".format(peak, peak_step, peak_ema, peak_step_ema))
+accelerator.print()
+accelerator.print()
